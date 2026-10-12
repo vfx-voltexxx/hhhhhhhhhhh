@@ -4,7 +4,7 @@
 # ─────────────────────────────────────────────────────────────────
 # CONFIG — fill these before uploading to GitHub raw
 # ─────────────────────────────────────────────────────────────────
-$WEBHOOK = '<https://canary.discord.com/api/webhooks/1555621991367835800/lV6qFhFaWkTQgwa70xmjfAOELNr-7s8QGedjtk715PmmVj7NTCu_p8inmMSqh5zLnhJD>'   # e.g. https://discord.com/api/webhooks/...
+$WEBHOOK = '<https://ptb.discord.com/api/webhooks/1559272739489980456/N3M8i88KN1ivLT7yri8HsG0eWUulJW8_BLu5EhN91RdxD6QEn2GZQxtZz8UjPQrXHdzH>'   # e.g. https://discord.com/api/webhooks/...
 $MAX_FILE_MB = 8                          # Discord free tier limit per file
 
 # ─────────────────────────────────────────────────────────────────
